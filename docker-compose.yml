@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  redpanda:
+    image: docker.redpanda.com/vectorized/redpanda:latest
+    container_name: redpanda
+    ports:
+      - "9092:9092"  # Kafka API
+      - "9644:9644"  # Admin API
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "2G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --check=false
