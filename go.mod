@@ -1,4 +1,4 @@
-module BlockHouse
+module github.com/hiiien/real-time-data
 
 go 1.23.3
 
