@@ -1,5 +1,5 @@
 {
     "broker": "localhost:9092",
-    "topic": "test-topic"
+    "topic": "default-topic"
   }
   

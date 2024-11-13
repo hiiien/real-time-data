@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin" // keep this import
 )
 
 func main() {
 	// r := gin.Default()
 	// r.GET("/ping", func(c *gin.Context) {
-	// 	c.JSON(http.StatusOK, gin.H{
+	// 	c.JSON(http.StatusOK, gin.H{go clean -modcache
 	// 		"message": "pong",
 	// 	})
 	// })
