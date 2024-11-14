@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -15,9 +18,31 @@ import (
 	"github.com/google/uuid"
 )
 
+// performance metrics
+// total number of messages attempted to send
+// how many successes
+// how many failures
+type StreamMetrics struct {
+	MessagesSent      atomic.Int64
+	MessagesSucceeded atomic.Int64
+	MessagesFailed    atomic.Int64
+}
+
+// config
 type Config struct { //struct for my redpanda
-	Broker string `json:"broker"`
-	Topic  string `json:"topic"`
+	Broker        string `json:"broker"`
+	Topic         string `json:"topic"`
+	NumPartitions int32  `json:"num_partitions"`
+	MaxConcurrent int    `json:"max_concurrent"`
+}
+
+// handles concurent streams management
+// controlls the streams
+// stores the active streams in a sync.Map
+type StreamManager struct {
+	streams     sync.Map
+	maxStreams  int
+	activeCount atomic.Int32
 }
 
 // async kafka producer
@@ -28,7 +53,7 @@ type ProducerManager struct {
 	Producer sarama.AsyncProducer
 	Config   Config
 	Signals  chan os.Signal
-	Enqueued int
+	Metrics  *StreamMetrics //use the stream metrics struct so we track metrics for each producer
 }
 
 type StockTrade struct {
@@ -43,13 +68,63 @@ type StockTrade struct {
 var (
 	activeStreams = make(map[int64]*ProducerManager)
 	streamsMutex  sync.RWMutex
+	streamManager *StreamManager
 )
 
+// constructor for a new manager
+// defines a stream limit to not overload the symstem
+func NewStreamManager(maxStreams int) *StreamManager {
+	return &StreamManager{
+		maxStreams: maxStreams,
+	}
+}
+
+// checks against the limit seeing if their is room for a new stream
+// if under limit add stream
+// concurrent stream count
+func (streamManager *StreamManager) AddStream(streamID int32, prodManger *ProducerManager) error {
+	if streamManager.activeCount.Load() >= int32(streamManager.maxStreams) {
+		return fmt.Errorf("maximum number of concurrent streams (%d) reached", streamManager.maxStreams)
+	}
+	streamManager.streams.Store(streamID, prodManger)
+	streamManager.activeCount.Add(1)
+	return nil
+}
+
+func (streamManager *StreamManager) GetStream(streamID int64) (*ProducerManager, bool) {
+	if value, ok := streamManager.streams.Load(streamID); ok {
+		return value.(*ProducerManager), true
+	}
+	return nil, false
+}
+
 func main() {
+	config, err := loadConfig("./config.json")
+	if err != nil {
+		log.Println("Error importing config: ", err)
+	}
+
+	broker := config.Broker
+	if broker == "" {
+		broker = "localhost:9092"
+	}
+
+	topicName := config.Topic
+	if broker == "" {
+		topicName = "stock-trades"
+	}
+
+	numPartitions := int32(100)
+	replicationFactor := int16(1)
+
+	if err := createTopic(broker, topicName, numPartitions, replicationFactor); err != nil {
+		log.Fatalf("Error setting up topic: %v", err)
+	}
 	router := gin.Default()
 	router.POST("/stream/start", startNewStream)
 	router.POST("/stream/:stream_id/send", prepareAndSendData)
 	router.GET("/stream/:stream_id/results")
+	router.GET("/stream/:stream_id/metrics", getStreamMetrics)
 
 	srv := &http.Server{
 		Addr:    ":8080",
@@ -61,6 +136,33 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+}
+
+func createTopic(broker string, topicName string, numPartitions int32, replicationFactor int16) error {
+	config := sarama.NewConfig()
+	admin, err := sarama.NewClusterAdmin([]string{broker}, config)
+	if err != nil {
+		return fmt.Errorf("failed to create cluster admin: %v", err)
+	}
+	defer admin.Close()
+
+	topicDetail := sarama.TopicDetail{
+		NumPartitions:     numPartitions,
+		ReplicationFactor: replicationFactor,
+		ConfigEntries:     map[string]*string{},
+	}
+
+	err = admin.CreateTopic(topicName, &topicDetail, false)
+	if err != nil {
+		if err == sarama.ErrTopicAlreadyExists {
+			log.Printf("Topic %s already exists", topicName)
+		} else {
+			return fmt.Errorf("failed to create topic: %v", err)
+		}
+	} else {
+		log.Printf("Topic %s created sucessfully", topicName)
+	}
+	return nil
 }
 
 // parse the string into int64 format
@@ -120,13 +222,14 @@ func prepareAndSendData(ctx *gin.Context) {
 		return
 	}
 	message := &sarama.ProducerMessage{
-		Topic: "stock-trades",
-		Key:   sarama.StringEncoder(fmt.Sprintf("%d", streamID)),
-		Value: sarama.ByteEncoder(jsonTrade),
+		Topic:     "stock-trades",
+		Partition: hashStreamID(streamID, prodManager.Config.NumPartitions), //num partitions 1500
+		Key:       sarama.StringEncoder(fmt.Sprintf("%d", streamID)),
+		Value:     sarama.ByteEncoder(jsonTrade),
 	}
 	select {
 	case prodManager.Producer.Input() <- message: // Sends the message to Kafka
-		prodManager.Enqueued++ // Increment the counter for successfully queued messages
+		prodManager.Metrics.MessagesSent.Add(1) // Increment the counter for successfully queued messages
 		ctx.JSON(http.StatusOK, gin.H{
 			"stream_id": streamID,
 			"trade":     trade,
@@ -136,6 +239,39 @@ func prepareAndSendData(ctx *gin.Context) {
 			"error": "Producer shutting down",
 		})
 	}
+}
+
+func getStreamMetrics(ctx *gin.Context) {
+	streamID, err := parseStreamId(ctx.Param("stream_id"))
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid stream ID",
+		})
+		return
+	}
+	prodManger, exists := streamManager.GetStream(streamID)
+	if !exists {
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"error": "Stream not found",
+		})
+		return
+	}
+
+	metrics := prodManger.Metrics
+	ctx.JSON(http.StatusOK, gin.H{
+		"stream_id":          streamID,
+		"messahes_sent":      metrics.MessagesSent.Load(),
+		"messages_succeeded": metrics.MessagesSucceeded.Load(),
+		"messages_failed":    metrics.MessagesFailed.Load(),
+	})
+}
+
+// hashing function for partitioning
+func hashStreamID(streamID int64, numPartitions int32) int32 {
+	startingHash := fnv.New32a()
+	binary.Write(startingHash, binary.LittleEndian, streamID)
+	hash := startingHash.Sum32()
+	return int32(hash) % numPartitions
 }
 
 func validateTrade(trade StockTrade) error {
@@ -239,7 +375,7 @@ func loadConfig(filepath string) (Config, error) {
 // loads config and sets up producer
 // graceful shutdown on os interrupts (CTRL + c)
 func NewProducerManager(config Config) (*ProducerManager, error) {
-	producer, err := setupProducer([]string{config.Broker})
+	producer, err := setupProducer([]string{config.Broker}, config)
 	if err != nil {
 		fmt.Printf("Error creating a new Async Producer: %s", err)
 	}
@@ -251,6 +387,7 @@ func NewProducerManager(config Config) (*ProducerManager, error) {
 		Producer: producer,
 		Config:   config,
 		Signals:  signals,
+		Metrics:  &StreamMetrics{},
 	}
 
 	go manager.handleSuccesses()
@@ -265,17 +402,28 @@ func NewProducerManager(config Config) (*ProducerManager, error) {
 // Allows for a seperate Success channel for monitoring
 // Allows for a seperate Error channel for monitoring
 // Returns the newAsyncProducer made with the configs
-func setupProducer(brokers []string) (sarama.AsyncProducer, error) {
-	config := sarama.NewConfig()
-	config.Producer.Retry.Max = 5
-	config.Producer.Return.Successes = true
-	config.Producer.Return.Errors = true
-	return sarama.NewAsyncProducer(brokers, config)
+func setupProducer(brokers []string, config Config) (sarama.AsyncProducer, error) {
+	if config.NumPartitions <= 0 {
+		return nil, fmt.Errorf("invalid number of partitions: %d", config.NumPartitions)
+	}
+
+	saramaConfig := sarama.NewConfig()
+	saramaConfig.Producer.Retry.Max = 5
+	saramaConfig.Producer.Return.Successes = true
+	saramaConfig.Producer.Return.Errors = true
+
+	producer, err := sarama.NewAsyncProducer(brokers, saramaConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create async producer: %w", err)
+	}
+
+	return producer, nil
 }
 
 // listens for any successful message deliveries
 func (prodManager *ProducerManager) handleSuccesses() {
 	for success := range prodManager.Producer.Successes() {
+		prodManager.Metrics.MessagesSucceeded.Add(1)
 		log.Printf("Message delivered to partition %d at offset %d\n", success.Partition, success.Offset)
 	}
 }
@@ -283,23 +431,7 @@ func (prodManager *ProducerManager) handleSuccesses() {
 // handleErrors listens for failed message deliveries
 func (prodManager *ProducerManager) handleErrors() {
 	for err := range prodManager.Producer.Errors() {
+		prodManager.Metrics.MessagesFailed.Add(1)
 		log.Printf("Failed to deliver message: %v\n", err)
-	}
-}
-
-// reads in input from the terminal to send to kafka
-// tracks interupt signals
-func (prodManager *ProducerManager) ProduceMessages(topic, value string) error {
-	message := &sarama.ProducerMessage{
-		Topic: topic,
-		Value: sarama.StringEncoder(value),
-	}
-	select {
-	case prodManager.Producer.Input() <- message: // Sends the message to Kafka
-		prodManager.Enqueued++ // Increment the counter for successfully queued messages
-		log.Printf("Queued message: %s (Topic: %s)", value, topic)
-		return nil
-	case <-prodManager.Signals: // Handles interrupt signals (Ctrl+C)
-		return fmt.Errorf("interrupt signal recieved, stopping production")
 	}
 }

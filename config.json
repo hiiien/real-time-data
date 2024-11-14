@@ -1,5 +1,7 @@
 {
     "broker": "localhost:9092",
-    "topic": "default-topic"
+    "topic": "stock-trades",
+    "num_partitions": 1500,
+    "max_concurrent": 100
   }
   
